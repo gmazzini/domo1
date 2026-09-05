@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2011- Version 5.02
+// Gianluca Mazzini @2011- Version 5.04
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -19,7 +19,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
-#define PROGRAM_VERSION "5.02"
+#define PROGRAM_VERSION "5.04"
 #define CONFIG_FILE "config"
 #define DEFAULT_LOG_FILE "domotic.log"
 #define LISTEN_IP "10.0.0.8"
@@ -38,10 +38,15 @@
 #define CONFIG_LINE_SIZE 2048
 #define HTTP_REQUEST_SIZE 2048
 #define HTTP_BODY_SIZE 65536
+#define HTTP_CLIENT_COUNT 8
+#define HTTP_HEADER_SIZE 256
+#define HTTP_IDLE_TIMEOUT_CS 500UL
 #define FORMAT_BUFFER_SIZE 2048
 #define LOG_LINE_SIZE 512
+#define BEM_RESPONSE_SIZE 512
 #define CONNECT_TIMEOUT_MS 500
 #define SOCKET_TIMEOUT_MS 300
+#define RECONNECT_DELAY_CS 500UL
 #define SCAN_DELAY_NS 20000000L
 #define LEVEL_INTERVAL_CS 500UL
 
@@ -82,6 +87,23 @@ typedef struct {
   unsigned long len;
 } Text;
 
+typedef struct {
+  char data[BEM_RESPONSE_SIZE];
+  int used;
+  int semicolons;
+  unsigned char pending;
+} BemRead;
+
+typedef struct {
+  char request[HTTP_REQUEST_SIZE];
+  char *response;
+  unsigned long deadline_cs;
+  unsigned long response_len;
+  unsigned long response_sent;
+  int fd;
+  int request_used;
+} HttpClient;
+
 static const char *board_ip[BOARD_COUNT]={
   "10.0.0.21", "10.0.0.22", "10.0.0.23", "10.0.0.24"
 };
@@ -101,6 +123,8 @@ static unsigned short input_state[INPUT_DEVICE_COUNT];
 static unsigned short input_old[INPUT_DEVICE_COUNT];
 static unsigned long relay_time[TOTAL_RELAYS];
 static unsigned long key_last_release[TOTAL_KEYS];
+static unsigned long input_retry[INPUT_DEVICE_COUNT];
+static unsigned long bem_output_retry[2];
 static int input_fd[INPUT_DEVICE_COUNT];
 static int event_count;
 static int inject_count;
@@ -109,9 +133,11 @@ static int server_fd;
 static FILE *log_fp;
 static volatile sig_atomic_t running=1;
 static Text http_body;
+static HttpClient http_client[HTTP_CLIENT_COUNT];
 
 static void stop_program(int sig);
 static unsigned long monotonic_cs(void);
+static unsigned long monotonic_ms(void);
 static void scan_delay(void);
 static void wall_time_string(char *out, int size);
 static void log_message(const char *format, ...);
@@ -130,9 +156,11 @@ static int open_server(void);
 static void close_input(int dev);
 static int ensure_input(int dev);
 static int send_all(int fd, const void *buffer, int size);
-static int recv_exact(int fd, void *buffer, int size);
 static int send_board_command(int dev, unsigned char command, unsigned char value);
-static int read_bem_input(int dev, unsigned short *value);
+static void read_board_group(unsigned char *ok, unsigned char *value);
+static int parse_bem_response(char *response, int used, unsigned short *value);
+static void start_bem_reads(BemRead *read);
+static void read_bem_group(BemRead *read, int timeout_ms);
 static void initialize_hardware(void);
 static void read_inputs(void);
 static void add_event(int key, int state, unsigned long now);
@@ -158,7 +186,8 @@ static void command_keys(Text *text);
 static void command_relays(Text *text);
 static void command_help(Text *text);
 static void handle_command(Text *text, char *path, const char *request_line);
-static void handle_client(int fd);
+static void close_http_client(int index);
+static int prepare_http_response(int index);
 static void service_http(void);
 static void cleanup(void);
 
@@ -185,6 +214,13 @@ static unsigned long monotonic_cs(void) {
     nsec+=1000000000L;
   }
   return (unsigned long)sec*100UL+(unsigned long)(nsec/10000000L);
+}
+
+static unsigned long monotonic_ms(void) {
+  struct timespec now;
+
+  if(clock_gettime(CLOCK_MONOTONIC,&now)!=0) return 0;
+  return (unsigned long)now.tv_sec*1000UL+(unsigned long)(now.tv_nsec/1000000L);
 }
 
 static void scan_delay(void) {
@@ -214,9 +250,14 @@ static void wall_time_string(char *out, int size) {
     return;
   }
   cs=(int)(now.tv_nsec/10000000L);
-  sprintf(out,"%02d-%02d-%04d/%02d:%02d:%02d.%02d",
-    local->tm_mday,local->tm_mon+1,local->tm_year+1900,
-    local->tm_hour,local->tm_min,local->tm_sec,cs);
+  if(strftime(out,(size_t)size,"%d-%m-%Y/%H:%M:%S",local)==0) {
+    strcpy(out,"00-00-0000/00:00:00.00");
+    return;
+  }
+  out[19]='.';
+  out[20]=(char)('0'+cs/10);
+  out[21]=(char)('0'+cs%10);
+  out[22]='\0';
 }
 
 static void log_message(const char *format, ...) {
@@ -256,8 +297,9 @@ static void text_addf(Text *text, const char *format, ...) {
   va_list args;
 
   va_start(args,format);
-  vsprintf(buffer,format,args);
+  vsnprintf(buffer,sizeof(buffer),format,args);
   va_end(args);
+  buffer[sizeof(buffer)-1]='\0';
   text_add(text,buffer);
 }
 
@@ -295,126 +337,126 @@ static int validate_rule(Rule *rule, char *error, int error_size) {
   int expected;
 
   if(rule->name[0]=='\0') {
-    sprintf(error,"rule name is empty");
+    snprintf(error,(size_t)error_size,"rule name is empty");
     return -1;
   }
   if(rule->count<2||rule->value[0]>23||rule->value[1]>23) {
-    sprintf(error,"invalid hour range in rule %s",rule->name);
+    snprintf(error,(size_t)error_size,"invalid hour range in rule %s",rule->name);
     return -1;
   }
   if(rule->type==RULE_INJECT_IF_OFF||rule->type==RULE_INJECT_IF_ON) {
     if(rule->count!=4||rule->value[1]>59||rule->value[2]>=TOTAL_KEYS||
       rule->value[3]>=TOTAL_RELAYS) {
-      sprintf(error,"invalid timed injection rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid timed injection rule %s",rule->name);
       return -1;
     }
     return 0;
   }
   if(rule->type==RULE_OFF_TIMED) {
     if(rule->count!=4||rule->value[2]>=TOTAL_RELAYS) {
-      sprintf(error,"invalid offtimed rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid offtimed rule %s",rule->name);
       return -1;
     }
     return 0;
   }
   if(rule->type==RULE_OFF_TIMED_KEYSUP) {
     if(rule->count<5) {
-      sprintf(error,"invalid offtimed_keysup rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid offtimed_keysup rule %s",rule->name);
       return -1;
     }
     n=rule->value[2];
     expected=5+n;
     if(n<1||rule->count!=expected) {
-      sprintf(error,"invalid key count in rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid key count in rule %s",rule->name);
       return -1;
     }
     for(i=0;i<n;i++) {
       if(rule->value[3+i]>=TOTAL_KEYS) {
-        sprintf(error,"invalid key in rule %s",rule->name);
+        snprintf(error,(size_t)error_size,"invalid key in rule %s",rule->name);
         return -1;
       }
     }
     if(rule->value[3+n]>=TOTAL_RELAYS) {
-      sprintf(error,"invalid relay in rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid relay in rule %s",rule->name);
       return -1;
     }
     return 0;
   }
   if(rule->type==RULE_3LEVEL) {
     if(rule->count<5) {
-      sprintf(error,"invalid 3level rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid 3level rule %s",rule->name);
       return -1;
     }
     n=rule->value[2];
     if(3+n>=rule->count) {
-      sprintf(error,"invalid key count in rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid key count in rule %s",rule->name);
       return -1;
     }
     m=rule->value[3+n];
     if(4+n+m>=rule->count) {
-      sprintf(error,"invalid relay A count in rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid relay A count in rule %s",rule->name);
       return -1;
     }
     q=rule->value[4+n+m];
     expected=5+n+m+q;
     if(rule->count!=expected) {
-      sprintf(error,"invalid 3level size in rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid 3level size in rule %s",rule->name);
       return -1;
     }
   } else if(rule->type==RULE_3LIGHT) {
     if(rule->count<6) {
-      sprintf(error,"invalid 3light rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid 3light rule %s",rule->name);
       return -1;
     }
     n=rule->value[2];
     if(3+n>=rule->count) {
-      sprintf(error,"invalid key count in rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid key count in rule %s",rule->name);
       return -1;
     }
     m=rule->value[3+n];
     if(4+n+m>=rule->count) {
-      sprintf(error,"invalid relay A count in rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid relay A count in rule %s",rule->name);
       return -1;
     }
     q=rule->value[4+n+m];
     if(5+n+m+q>=rule->count) {
-      sprintf(error,"invalid relay B count in rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid relay B count in rule %s",rule->name);
       return -1;
     }
     v=rule->value[5+n+m+q];
     expected=6+n+m+q+v;
     if(rule->count!=expected) {
-      sprintf(error,"invalid 3light size in rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid 3light size in rule %s",rule->name);
       return -1;
     }
   } else if(rule->type==RULE_ONOFF||rule->type==RULE_ON||
     rule->type==RULE_OFF||rule->type==RULE_ALLOFF||rule->type==RULE_PUSH) {
     if(rule->count<4) {
-      sprintf(error,"invalid rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid rule %s",rule->name);
       return -1;
     }
     n=rule->value[2];
     if(3+n>=rule->count) {
-      sprintf(error,"invalid key count in rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid key count in rule %s",rule->name);
       return -1;
     }
     m=rule->value[3+n];
     expected=4+n+m;
     if(rule->count!=expected) {
-      sprintf(error,"invalid relay count in rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid relay count in rule %s",rule->name);
       return -1;
     }
     q=0;
     v=0;
   } else {
-    sprintf(error,"unsupported rule type %d",rule->type);
+    snprintf(error,(size_t)error_size,"unsupported rule type %d",rule->type);
     return -1;
   }
 
   n=rule->value[2];
   for(i=0;i<n;i++) {
     if(rule->value[3+i]>=TOTAL_KEYS) {
-      sprintf(error,"invalid key in rule %s",rule->name);
+      snprintf(error,(size_t)error_size,"invalid key in rule %s",rule->name);
       return -1;
     }
   }
@@ -422,14 +464,14 @@ static int validate_rule(Rule *rule, char *error, int error_size) {
     m=rule->value[3+n];
     for(i=0;i<m;i++) {
       if(rule->value[4+n+i]>=TOTAL_RELAYS) {
-        sprintf(error,"invalid relay A in rule %s",rule->name);
+        snprintf(error,(size_t)error_size,"invalid relay A in rule %s",rule->name);
         return -1;
       }
     }
     q=rule->value[4+n+m];
     for(i=0;i<q;i++) {
       if(rule->value[5+n+m+i]>=TOTAL_RELAYS) {
-        sprintf(error,"invalid relay B in rule %s",rule->name);
+        snprintf(error,(size_t)error_size,"invalid relay B in rule %s",rule->name);
         return -1;
       }
     }
@@ -437,7 +479,7 @@ static int validate_rule(Rule *rule, char *error, int error_size) {
       v=rule->value[5+n+m+q];
       for(i=0;i<v;i++) {
         if(rule->value[6+n+m+q+i]>=TOTAL_RELAYS) {
-          sprintf(error,"invalid relay C in rule %s",rule->name);
+          snprintf(error,(size_t)error_size,"invalid relay C in rule %s",rule->name);
           return -1;
         }
       }
@@ -446,7 +488,7 @@ static int validate_rule(Rule *rule, char *error, int error_size) {
     m=rule->value[3+n];
     for(i=0;i<m;i++) {
       if(rule->value[4+n+i]>=TOTAL_RELAYS) {
-        sprintf(error,"invalid relay in rule %s",rule->name);
+        snprintf(error,(size_t)error_size,"invalid relay in rule %s",rule->name);
         return -1;
       }
     }
@@ -474,7 +516,7 @@ static int load_config(const char *path, Config *out, char *error, int error_siz
   strcpy(temp.log_path,DEFAULT_LOG_FILE);
   fp=fopen(path,"r");
   if(fp==NULL) {
-    sprintf(error,"cannot open %s: %s",path,strerror(errno));
+    snprintf(error,(size_t)error_size,"cannot open %s: %s",path,strerror(errno));
     return -1;
   }
   line_number=0;
@@ -486,7 +528,7 @@ static int load_config(const char *path, Config *out, char *error, int error_siz
     if(strncmp(text,"version ",8)==0) {
       text=trim(text+8);
       if(*text=='\0'||strlen(text)>=sizeof(temp.version)) {
-        sprintf(error,"line %d: invalid version",line_number);
+        snprintf(error,(size_t)error_size,"line %d: invalid version",line_number);
         fclose(fp);
         return -1;
       }
@@ -497,7 +539,7 @@ static int load_config(const char *path, Config *out, char *error, int error_siz
     if(strncmp(text,"log ",4)==0) {
       text=trim(text+4);
       if(*text=='\0'||strlen(text)>=sizeof(temp.log_path)) {
-        sprintf(error,"line %d: invalid log path",line_number);
+        snprintf(error,(size_t)error_size,"line %d: invalid log path",line_number);
         fclose(fp);
         return -1;
       }
@@ -505,31 +547,31 @@ static int load_config(const char *path, Config *out, char *error, int error_siz
       continue;
     }
     if(strncmp(text,"rule ",5)!=0) {
-      sprintf(error,"line %d: unknown directive",line_number);
+      snprintf(error,(size_t)error_size,"line %d: unknown directive",line_number);
       fclose(fp);
       return -1;
     }
     if(temp.rule_count>=MAX_RULES) {
-      sprintf(error,"line %d: too many rules",line_number);
+      snprintf(error,(size_t)error_size,"line %d: too many rules",line_number);
       fclose(fp);
       return -1;
     }
     if(strlen(text)>=sizeof(work)) {
-      sprintf(error,"line %d: rule too long",line_number);
+      snprintf(error,(size_t)error_size,"line %d: rule too long",line_number);
       fclose(fp);
       return -1;
     }
     strcpy(work,text+5);
     separator=strchr(work,'|');
     if(separator==NULL) {
-      sprintf(error,"line %d: missing rule name separator",line_number);
+      snprintf(error,(size_t)error_size,"line %d: missing rule name separator",line_number);
       fclose(fp);
       return -1;
     }
     *separator='\0';
     name=trim(separator+1);
     if(*name=='\0'||strlen(name)>=MAX_RULE_NAME) {
-      sprintf(error,"line %d: invalid rule name",line_number);
+      snprintf(error,(size_t)error_size,"line %d: invalid rule name",line_number);
       fclose(fp);
       return -1;
     }
@@ -538,7 +580,7 @@ static int load_config(const char *path, Config *out, char *error, int error_siz
     strcpy(rule->name,name);
     token=strtok(work," \t");
     if(token==NULL||parse_number(token,0,11,&number)!=0) {
-      sprintf(error,"line %d: invalid rule type",line_number);
+      snprintf(error,(size_t)error_size,"line %d: invalid rule type",line_number);
       fclose(fp);
       return -1;
     }
@@ -546,7 +588,7 @@ static int load_config(const char *path, Config *out, char *error, int error_siz
     i=0;
     for(token=strtok(NULL," \t");token!=NULL;token=strtok(NULL," \t")) {
       if(i>=MAX_RULE_VALUES||parse_number(token,0,65535,&number)!=0) {
-        sprintf(error,"line %d: invalid rule value",line_number);
+        snprintf(error,(size_t)error_size,"line %d: invalid rule value",line_number);
         fclose(fp);
         return -1;
       }
@@ -558,20 +600,20 @@ static int load_config(const char *path, Config *out, char *error, int error_siz
       char detail[CONFIG_LINE_SIZE];
 
       strcpy(detail,error);
-      sprintf(error,"line %d: %s",line_number,detail);
+      snprintf(error,(size_t)error_size,"line %d: %s",line_number,detail);
       fclose(fp);
       return -1;
     }
     temp.rule_count++;
   }
   if(ferror(fp)) {
-    sprintf(error,"cannot read %s: %s",path,strerror(errno));
+    snprintf(error,(size_t)error_size,"cannot read %s: %s",path,strerror(errno));
     fclose(fp);
     return -1;
   }
   fclose(fp);
   if(!have_version) {
-    sprintf(error,"missing version directive");
+    snprintf(error,(size_t)error_size,"missing version directive");
     return -1;
   }
   *out=temp;
@@ -694,14 +736,18 @@ static void close_input(int dev) {
   if(dev<0||dev>=INPUT_DEVICE_COUNT) return;
   if(input_fd[dev]>=0) close(input_fd[dev]);
   input_fd[dev]=-1;
+  input_retry[dev]=monotonic_cs()+RECONNECT_DELAY_CS;
 }
 
 static int ensure_input(int dev) {
   const char *ip;
+  unsigned long now;
   int port;
 
   if(dev<0||dev>=INPUT_DEVICE_COUNT) return -1;
   if(input_fd[dev]>=0) return input_fd[dev];
+  now=monotonic_cs();
+  if(now<input_retry[dev]) return -1;
   if(dev<BOARD_COUNT) {
     ip=board_ip[dev];
     port=10001;
@@ -710,6 +756,8 @@ static int ensure_input(int dev) {
     port=5000;
   }
   input_fd[dev]=connect_tcp(ip,port);
+  if(input_fd[dev]<0) input_retry[dev]=now+RECONNECT_DELAY_CS;
+  else input_retry[dev]=0;
   return input_fd[dev];
 }
 
@@ -729,22 +777,6 @@ static int send_all(int fd, const void *buffer, int size) {
   return 0;
 }
 
-static int recv_exact(int fd, void *buffer, int size) {
-  char *ptr;
-  ssize_t received;
-  int done;
-
-  ptr=(char *)buffer;
-  done=0;
-  for(;done<size;) {
-    received=recv(fd,ptr+done,(size_t)(size-done),0);
-    if(received<0&&errno==EINTR) continue;
-    if(received<=0) return -1;
-    done+=(int)received;
-  }
-  return 0;
-}
-
 static int send_board_command(int dev, unsigned char command, unsigned char value) {
   unsigned char message[2];
   int fd;
@@ -760,39 +792,67 @@ static int send_board_command(int dev, unsigned char command, unsigned char valu
   return 0;
 }
 
-static int read_bem_input(int dev, unsigned short *value) {
-  static const char *request[2]={
-    "getpara[189]=1;getpara[190]=1;getpara[191]=1;getpara[192]=1;getpara[193]=1;getpara[194]=1;getpara[195]=1;getpara[196]=1;",
-    "getpara[196]=1;getpara[195]=1;getpara[194]=1;getpara[193]=1;getpara[192]=1;getpara[191]=1;getpara[190]=1;getpara[189]=1;"
-  };
-  char response[1024];
-  char *ptr;
+static void read_board_group(unsigned char *ok, unsigned char *value) {
+  fd_set read_set;
+  struct timeval timeout;
+  unsigned long deadline;
+  unsigned long now;
+  unsigned long left;
   ssize_t received;
+  int dev;
   int fd;
-  int used;
-  int semicolons;
-  int i;
+  int maxfd;
+  int pending;
+  int result;
+
+  deadline=monotonic_ms()+SOCKET_TIMEOUT_MS;
+  for(;;) {
+    FD_ZERO(&read_set);
+    maxfd=-1;
+    pending=0;
+    for(dev=0;dev<BOARD_COUNT;dev++) {
+      if(ok[dev]!=1) continue;
+      fd=input_fd[dev];
+      if(fd<0) {
+        ok[dev]=0;
+        continue;
+      }
+      FD_SET(fd,&read_set);
+      if(fd>maxfd) maxfd=fd;
+      pending++;
+    }
+    if(!pending) return;
+    now=monotonic_ms();
+    if(now>=deadline) break;
+    left=deadline-now;
+    timeout.tv_sec=(long)(left/1000UL);
+    timeout.tv_usec=(long)(left%1000UL)*1000L;
+    result=select(maxfd+1,&read_set,NULL,NULL,&timeout);
+    if(result<0&&errno==EINTR) continue;
+    if(result<=0) break;
+    for(dev=0;dev<BOARD_COUNT;dev++) {
+      if(ok[dev]!=1||!FD_ISSET(input_fd[dev],&read_set)) continue;
+      received=recv(input_fd[dev],&value[dev],1,0);
+      if(received==1) ok[dev]=2;
+      else {
+        ok[dev]=0;
+        close_input(dev);
+      }
+    }
+  }
+  for(dev=0;dev<BOARD_COUNT;dev++) {
+    if(ok[dev]!=1) continue;
+    ok[dev]=0;
+    close_input(dev);
+  }
+}
+
+static int parse_bem_response(char *response, int used, unsigned short *value) {
+  char *ptr;
   int bit_count;
   unsigned short result;
 
-  fd=ensure_input(dev);
-  if(fd<0) return -1;
-  if(send_all(fd,request[dev-BOARD_COUNT],(int)strlen(request[dev-BOARD_COUNT]))!=0) {
-    close_input(dev);
-    return -1;
-  }
-  used=0;
-  semicolons=0;
-  for(;used<(int)sizeof(response)-1&&semicolons<8;) {
-    received=recv(fd,response+used,sizeof(response)-1-(size_t)used,0);
-    if(received<0&&errno==EINTR) continue;
-    if(received<=0) {
-      close_input(dev);
-      return -1;
-    }
-    for(i=0;i<(int)received;i++) if(response[used+i]==';') semicolons++;
-    used+=(int)received;
-  }
+  if(used<0||used>=BEM_RESPONSE_SIZE) return -1;
   response[used]='\0';
   result=0;
   bit_count=0;
@@ -805,12 +865,117 @@ static int read_bem_input(int dev, unsigned short *value) {
     result=(unsigned short)((result<<1)+(1-(*ptr-'0')));
     bit_count++;
   }
-  if(bit_count!=8) {
-    close_input(dev);
-    return -1;
-  }
+  if(bit_count!=8) return -1;
   *value=result;
   return 0;
+}
+
+static void start_bem_reads(BemRead *read) {
+  static const char *request[2]={
+    "getpara[189]=1;getpara[190]=1;getpara[191]=1;getpara[192]=1;getpara[193]=1;getpara[194]=1;getpara[195]=1;getpara[196]=1;",
+    "getpara[196]=1;getpara[195]=1;getpara[194]=1;getpara[193]=1;getpara[192]=1;getpara[191]=1;getpara[190]=1;getpara[189]=1;"
+  };
+  int i;
+  int dev;
+  int fd;
+
+  for(i=0;i<2;i++) {
+    read[i].used=0;
+    read[i].semicolons=0;
+    read[i].pending=0;
+    dev=BOARD_COUNT+i;
+    fd=ensure_input(dev);
+    if(fd<0) continue;
+    if(send_all(fd,request[i],(int)strlen(request[i]))!=0) {
+      close_input(dev);
+      continue;
+    }
+    read[i].pending=1;
+  }
+}
+
+static void read_bem_group(BemRead *read, int timeout_ms) {
+  fd_set read_set;
+  struct timeval timeout;
+  unsigned long deadline;
+  unsigned long now;
+  unsigned long left;
+  unsigned short value;
+  ssize_t received;
+  int i;
+  int j;
+  int dev;
+  int fd;
+  int maxfd;
+  int pending;
+  int result;
+
+  deadline=monotonic_ms()+(unsigned long)timeout_ms;
+  for(;;) {
+    FD_ZERO(&read_set);
+    maxfd=-1;
+    pending=0;
+    for(i=0;i<2;i++) {
+      if(!read[i].pending) continue;
+      dev=BOARD_COUNT+i;
+      fd=input_fd[dev];
+      if(fd<0) {
+        read[i].pending=0;
+        continue;
+      }
+      FD_SET(fd,&read_set);
+      if(fd>maxfd) maxfd=fd;
+      pending++;
+    }
+    if(!pending) return;
+    now=monotonic_ms();
+    if(timeout_ms==0) {
+      timeout.tv_sec=0;
+      timeout.tv_usec=0;
+    } else {
+      if(now>=deadline) break;
+      left=deadline-now;
+      timeout.tv_sec=(long)(left/1000UL);
+      timeout.tv_usec=(long)(left%1000UL)*1000L;
+    }
+    result=select(maxfd+1,&read_set,NULL,NULL,&timeout);
+    if(result<0&&errno==EINTR) continue;
+    if(result<=0) break;
+    for(i=0;i<2;i++) {
+      if(!read[i].pending) continue;
+      dev=BOARD_COUNT+i;
+      fd=input_fd[dev];
+      if(fd<0||!FD_ISSET(fd,&read_set)) continue;
+      if(read[i].used>=BEM_RESPONSE_SIZE-1) {
+        read[i].pending=0;
+        close_input(dev);
+        continue;
+      }
+      received=recv(fd,read[i].data+read[i].used,
+        (size_t)(BEM_RESPONSE_SIZE-1-read[i].used),0);
+      if(received<=0) {
+        if(received<0&&errno==EINTR) continue;
+        read[i].pending=0;
+        close_input(dev);
+        continue;
+      }
+      for(j=0;j<(int)received;j++) if(read[i].data[read[i].used+j]==';') read[i].semicolons++;
+      read[i].used+=(int)received;
+      if(read[i].semicolons<8) continue;
+      if(parse_bem_response(read[i].data,read[i].used,&value)==0) {
+        input_state[dev]=value;
+        input_valid[dev]=1;
+      } else close_input(dev);
+      read[i].pending=0;
+    }
+    if(timeout_ms==0) continue;
+  }
+  if(timeout_ms==0) return;
+  for(i=0;i<2;i++) {
+    if(!read[i].pending) continue;
+    read[i].pending=0;
+    close_input(BOARD_COUNT+i);
+  }
 }
 
 static void initialize_hardware(void) {
@@ -846,45 +1011,39 @@ static void initialize_hardware(void) {
 }
 
 static void read_inputs(void) {
+  BemRead bem[2];
   unsigned char low[BOARD_COUNT];
   unsigned char high[BOARD_COUNT];
   unsigned char low_ok[BOARD_COUNT];
-  unsigned short value;
+  unsigned char high_ok[BOARD_COUNT];
   int dev;
 
   memset(low_ok,0,sizeof(low_ok));
+  memset(high_ok,0,sizeof(high_ok));
   memset(input_valid,0,sizeof(input_valid));
+
+  start_bem_reads(bem);
   for(dev=0;dev<BOARD_COUNT;dev++) {
     if(send_board_command(dev,0x47,0x00)==0) low_ok[dev]=1;
   }
   scan_delay();
+  read_bem_group(bem,0);
+  read_board_group(low_ok,low);
+
   for(dev=0;dev<BOARD_COUNT;dev++) {
-    if(!low_ok[dev]) continue;
-    if(recv_exact(input_fd[dev],&low[dev],1)!=0) {
-      low_ok[dev]=0;
-      close_input(dev);
-    }
-  }
-  for(dev=0;dev<BOARD_COUNT;dev++) {
-    if(!low_ok[dev]) continue;
-    if(send_board_command(dev,0x44,0x00)!=0) low_ok[dev]=0;
+    if(low_ok[dev]!=2) continue;
+    if(send_board_command(dev,0x44,0x00)==0) high_ok[dev]=1;
   }
   scan_delay();
+  read_bem_group(bem,0);
+  read_board_group(high_ok,high);
+
   for(dev=0;dev<BOARD_COUNT;dev++) {
-    if(!low_ok[dev]) continue;
-    if(recv_exact(input_fd[dev],&high[dev],1)!=0) {
-      close_input(dev);
-      continue;
-    }
+    if(high_ok[dev]!=2) continue;
     input_state[dev]=(unsigned short)(low[dev]|((high[dev]&0x0f)<<8));
     input_valid[dev]=1;
   }
-  for(dev=BOARD_COUNT;dev<INPUT_DEVICE_COUNT;dev++) {
-    if(read_bem_input(dev,&value)==0) {
-      input_state[dev]=value;
-      input_valid[dev]=1;
-    }
-  }
+  read_bem_group(bem,SOCKET_TIMEOUT_MS);
 }
 
 static void add_event(int key, int state, unsigned long now) {
@@ -1173,70 +1332,116 @@ static void update_key_times(void) {
 
 static int send_bem_outputs(int first_relay, const char *ip) {
   char message[128];
+  char stamp[32];
+  unsigned long now;
+  int bank;
   int fd;
   int relay;
   int used;
   int changed;
 
+  bank=(first_relay-48)/8;
+  now=monotonic_cs();
+  if(bank<0||bank>1||now<bem_output_retry[bank]) return -1;
   used=0;
   changed=0;
   for(relay=first_relay;relay<first_relay+8;relay++) {
     if(relay_state[relay]==relay_old[relay]) continue;
     used+=sprintf(message+used,"k0%c=%c;",'1'+relay-first_relay,'0'+relay_state[relay]);
-    relay_old[relay]=relay_state[relay];
     changed=1;
   }
   if(!changed) return 0;
   fd=connect_tcp(ip,5000);
-  if(fd<0) return -1;
+  if(fd<0) {
+    bem_output_retry[bank]=now+RECONNECT_DELAY_CS;
+    return -1;
+  }
   if(send_all(fd,message,used)!=0) {
     close(fd);
+    bem_output_retry[bank]=now+RECONNECT_DELAY_CS;
     return -1;
   }
   close(fd);
+  bem_output_retry[bank]=0;
+  for(relay=first_relay;relay<first_relay+8;relay++) {
+    if(relay_state[relay]==relay_old[relay]) continue;
+    wall_time_string(stamp,sizeof(stamp));
+    log_message("out: %02d %01d %s\n",relay,relay_state[relay],stamp);
+    relay_old[relay]=relay_state[relay];
+  }
   return 0;
 }
 
 static void write_outputs(void) {
-  unsigned char value_a;
-  unsigned char value_b;
-  unsigned char changed_a;
-  unsigned char changed_b;
+  unsigned char value_a[BOARD_COUNT];
+  unsigned char value_b[BOARD_COUNT];
+  unsigned char changed_a[BOARD_COUNT];
+  unsigned char changed_b[BOARD_COUNT];
+  unsigned char sent_a[BOARD_COUNT];
+  unsigned char sent_b[BOARD_COUNT];
   char stamp[32];
   int dev;
   int i;
   int relay;
+  int any;
+
+  memset(value_a,0,sizeof(value_a));
+  memset(value_b,0,sizeof(value_b));
+  memset(changed_a,0,sizeof(changed_a));
+  memset(changed_b,0,sizeof(changed_b));
+  memset(sent_a,0,sizeof(sent_a));
+  memset(sent_b,0,sizeof(sent_b));
 
   for(dev=0;dev<BOARD_COUNT;dev++) {
-    value_a=0;
-    value_b=0;
-    changed_a=0;
-    changed_b=0;
     for(i=0;i<12;i++) {
       relay=dev*12+i;
       if(relay_state[relay]!=relay_old[relay]) {
-        wall_time_string(stamp,sizeof(stamp));
-        log_message("out: %02d %01d %s\n",relay,relay_state[relay],stamp);
-        if(i<8) changed_a=1;
-        else changed_b=1;
+        if(i<8) changed_a[dev]=1;
+        else changed_b[dev]=1;
       }
-      if(relay_state[relay]) {
-        if(i<8) value_a=(unsigned char)(value_a|(1U<<i));
-        else value_b=(unsigned char)(value_b|(1U<<(i-4)));
-      }
-      relay_old[relay]=relay_state[relay];
+      if(!relay_state[relay]) continue;
+      if(i<8) value_a[dev]=(unsigned char)(value_a[dev]|(1U<<i));
+      else value_b[dev]=(unsigned char)(value_b[dev]|(1U<<(i-4)));
     }
-    if(changed_a) send_board_command(dev,0x43,value_a);
-    if(changed_a) scan_delay();
-    if(changed_b) send_board_command(dev,0x46,value_b);
-    if(changed_b) scan_delay();
   }
 
-  for(relay=48;relay<64;relay++) {
-    if(relay_state[relay]==relay_old[relay]) continue;
-    wall_time_string(stamp,sizeof(stamp));
-    log_message("out: %02d %01d %s\n",relay,relay_state[relay],stamp);
+  any=0;
+  for(dev=0;dev<BOARD_COUNT;dev++) {
+    if(!changed_a[dev]) continue;
+    if(send_board_command(dev,0x43,value_a[dev])==0) sent_a[dev]=1;
+    any=1;
   }
+  if(any) scan_delay();
+
+  any=0;
+  for(dev=0;dev<BOARD_COUNT;dev++) {
+    if(!changed_b[dev]) continue;
+    if(send_board_command(dev,0x46,value_b[dev])==0) sent_b[dev]=1;
+    any=1;
+  }
+  if(any) scan_delay();
+
+  for(dev=0;dev<BOARD_COUNT;dev++) {
+    if(sent_a[dev]) {
+      for(i=0;i<8;i++) {
+        relay=dev*12+i;
+        if(relay_state[relay]==relay_old[relay]) continue;
+        wall_time_string(stamp,sizeof(stamp));
+        log_message("out: %02d %01d %s\n",relay,relay_state[relay],stamp);
+        relay_old[relay]=relay_state[relay];
+      }
+    }
+    if(sent_b[dev]) {
+      for(i=8;i<12;i++) {
+        relay=dev*12+i;
+        if(relay_state[relay]==relay_old[relay]) continue;
+        wall_time_string(stamp,sizeof(stamp));
+        log_message("out: %02d %01d %s\n",relay,relay_state[relay],stamp);
+        relay_old[relay]=relay_state[relay];
+      }
+    }
+  }
+
   send_bem_outputs(48,bem_output_ip[0]);
   send_bem_outputs(56,bem_output_ip[1]);
 }
@@ -1545,7 +1750,6 @@ static void handle_command(Text *text, char *path, const char *request_line) {
   unsigned long now;
   long number;
   int relay;
-  int i;
 
   password=strtok(path,"/");
   command=strtok(NULL,"/");
@@ -1612,82 +1816,173 @@ static void handle_command(Text *text, char *path, const char *request_line) {
     text_add(text,"<i>Wrong Command</i>\n");
   }
 
-  i=0;
-  if(i) text_add(text,"");
 }
 
-static void handle_client(int fd) {
-  char request[HTTP_REQUEST_SIZE];
+static void close_http_client(int index) {
+  HttpClient *client;
+
+  if(index<0||index>=HTTP_CLIENT_COUNT) return;
+  client=&http_client[index];
+  if(client->fd>=0) close(client->fd);
+  if(client->response!=NULL) free(client->response);
+  client->fd=-1;
+  client->response=NULL;
+  client->deadline_cs=0;
+  client->response_len=0;
+  client->response_sent=0;
+  client->request_used=0;
+}
+
+static int prepare_http_response(int index) {
+  HttpClient *client;
   char path[HTTP_REQUEST_SIZE];
-  char header[256];
+  char header[HTTP_HEADER_SIZE];
   char *line_end;
   char *path_end;
-  ssize_t received;
-  int used;
+  unsigned long header_len;
+  unsigned long total_len;
+  int n;
 
-  used=0;
-  for(;used<(int)sizeof(request)-1;) {
-    received=recv(fd,request+used,sizeof(request)-1-(size_t)used,0);
-    if(received<0&&errno==EINTR) continue;
-    if(received<=0) break;
-    used+=(int)received;
-    request[used]='\0';
-    if(strstr(request,"\r\n")!=NULL||strchr(request,'\n')!=NULL) break;
-  }
-  request[used]='\0';
+  client=&http_client[index];
+  client->request[client->request_used]='\0';
   text_clear(&http_body);
   text_add(&http_body,"<html><body style='background-color:#F9F4B7'><pre>");
-  if(strncmp(request,"GET ",4)!=0) {
+  if(strncmp(client->request,"GET ",4)!=0) {
     text_add(&http_body,"Wrong Parameters\n");
   } else {
-    line_end=strstr(request,"\r\n");
-    if(line_end==NULL) line_end=strchr(request,'\n');
+    line_end=strstr(client->request,"\r\n");
+    if(line_end==NULL) line_end=strchr(client->request,'\n');
     if(line_end!=NULL) *line_end='\0';
-    path_end=strchr(request+4,' ');
-    if(path_end==NULL||(unsigned long)(path_end-(request+4))>=sizeof(path)) {
+    path_end=strchr(client->request+4,' ');
+    if(path_end==NULL||(unsigned long)(path_end-(client->request+4))>=sizeof(path)) {
       text_add(&http_body,"Wrong Parameters\n");
     } else {
-      memcpy(path,request+4,(size_t)(path_end-(request+4)));
-      path[path_end-(request+4)]='\0';
-      handle_command(&http_body,path,request);
+      memcpy(path,client->request+4,(size_t)(path_end-(client->request+4)));
+      path[path_end-(client->request+4)]='\0';
+      handle_command(&http_body,path,client->request);
     }
   }
   text_add(&http_body,"</pre></body></html>");
-  sprintf(header,
+  n=snprintf(header,sizeof(header),
     "HTTP/1.1 200 OK\r\nCache-Control: no-cache\r\nContent-Type: text/html\r\nContent-Length: %lu\r\nConnection: Close\r\n\r\n",
     http_body.len);
-  send_all(fd,header,(int)strlen(header));
-  send_all(fd,http_body.data,(int)http_body.len);
+  if(n<0||(unsigned long)n>=sizeof(header)) return -1;
+  header_len=(unsigned long)n;
+  total_len=header_len+http_body.len;
+  client->response=(char *)malloc((size_t)total_len);
+  if(client->response==NULL) return -1;
+  memcpy(client->response,header,(size_t)header_len);
+  memcpy(client->response+header_len,http_body.data,(size_t)http_body.len);
+  client->response_len=total_len;
+  client->response_sent=0;
+  return 0;
 }
 
 static void service_http(void) {
   struct sockaddr_in address;
-  struct timeval timeout;
+  HttpClient *client;
   socklen_t length;
+  unsigned long now;
+  ssize_t count;
   int fd;
+  int flags;
+  int slot;
   int i;
 
-  for(i=0;i<8;i++) {
+  now=monotonic_cs();
+  for(;;) {
     length=sizeof(address);
     fd=accept(server_fd,(struct sockaddr *)&address,&length);
     if(fd<0) {
       if(errno==EINTR) continue;
       break;
     }
-    timeout.tv_sec=0;
-    timeout.tv_usec=SOCKET_TIMEOUT_MS*1000;
-    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
-    setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
-    handle_client(fd);
-    close(fd);
+    slot=-1;
+    for(i=0;i<HTTP_CLIENT_COUNT;i++) {
+      if(http_client[i].fd<0) {
+        slot=i;
+        break;
+      }
+    }
+    if(slot<0) {
+      close(fd);
+      continue;
+    }
+    flags=fcntl(fd,F_GETFL,0);
+    if(flags<0||fcntl(fd,F_SETFL,flags|O_NONBLOCK)<0) {
+      close(fd);
+      continue;
+    }
+    client=&http_client[slot];
+    client->fd=fd;
+    client->response=NULL;
+    client->deadline_cs=now+HTTP_IDLE_TIMEOUT_CS;
+    client->response_len=0;
+    client->response_sent=0;
+    client->request_used=0;
+  }
+
+  for(i=0;i<HTTP_CLIENT_COUNT;i++) {
+    client=&http_client[i];
+    if(client->fd<0) continue;
+    if(now>client->deadline_cs) {
+      close_http_client(i);
+      continue;
+    }
+
+    if(client->response==NULL) {
+      for(;;) {
+        count=recv(client->fd,client->request+client->request_used,
+          sizeof(client->request)-1-(size_t)client->request_used,0);
+        if(count>0) {
+          client->request_used+=(int)count;
+          client->request[client->request_used]='\0';
+          client->deadline_cs=now+HTTP_IDLE_TIMEOUT_CS;
+          if(strstr(client->request,"\r\n")!=NULL||
+            strchr(client->request,'\n')!=NULL||
+            client->request_used>=(int)sizeof(client->request)-1) {
+            if(prepare_http_response(i)!=0) close_http_client(i);
+            break;
+          }
+          continue;
+        }
+        if(count==0) {
+          close_http_client(i);
+          break;
+        }
+        if(errno==EINTR) continue;
+        if(errno==EAGAIN||errno==EWOULDBLOCK) break;
+        close_http_client(i);
+        break;
+      }
+    }
+
+    client=&http_client[i];
+    if(client->fd<0||client->response==NULL) continue;
+    for(;client->response_sent<client->response_len;) {
+      count=send(client->fd,client->response+client->response_sent,
+        (size_t)(client->response_len-client->response_sent),MSG_NOSIGNAL);
+      if(count>0) {
+        client->response_sent+=(unsigned long)count;
+        client->deadline_cs=now+HTTP_IDLE_TIMEOUT_CS;
+        continue;
+      }
+      if(count<0&&errno==EINTR) continue;
+      if(count<0&&(errno==EAGAIN||errno==EWOULDBLOCK)) break;
+      close_http_client(i);
+      break;
+    }
+    if(client->fd>=0&&client->response_sent>=client->response_len) close_http_client(i);
   }
 }
 
 static void cleanup(void) {
   int dev;
+  int i;
 
   if(server_fd>=0) close(server_fd);
   server_fd=-1;
+  for(i=0;i<HTTP_CLIENT_COUNT;i++) close_http_client(i);
   for(dev=0;dev<INPUT_DEVICE_COUNT;dev++) close_input(dev);
   if(log_fp!=NULL) fclose(log_fp);
   log_fp=NULL;
@@ -1705,11 +2000,23 @@ int main(void) {
   int minute;
   int i;
 
-  for(i=0;i<INPUT_DEVICE_COUNT;i++) input_fd[i]=-1;
-  for(i=0;i<INPUT_DEVICE_COUNT;i++) input_old[i]=0xffff;
+  for(i=0;i<INPUT_DEVICE_COUNT;i++) {
+    input_fd[i]=-1;
+    input_retry[i]=0;
+    input_old[i]=0xffff;
+  }
+  for(i=0;i<2;i++) bem_output_retry[i]=0;
   for(i=0;i<TOTAL_RELAYS;i++) relay_time[i]=0;
   server_fd=-1;
   log_fp=NULL;
+  for(i=0;i<HTTP_CLIENT_COUNT;i++) {
+    http_client[i].fd=-1;
+    http_client[i].response=NULL;
+    http_client[i].deadline_cs=0;
+    http_client[i].response_len=0;
+    http_client[i].response_sent=0;
+    http_client[i].request_used=0;
+  }
   event_count=0;
   inject_count=0;
   keyoff=0;

@@ -1,4 +1,4 @@
-# domotic 5.02
+# domotic 5.04
 
 Single-process C implementation of the original PHP home automation controller.
 
@@ -74,20 +74,21 @@ The controller preserves the original network layout:
 
 There are 64 relays and 72 keys. Physical keys are 0-63 and virtual keys are 64-71. Physical key ranges are mapped exactly as in the PHP program: 0-11, 12-23, 24-35, 36-47, 48-55 and 56-63.
 
-The four first boards are kept connected and automatically reconnected after communication errors. The BEM input connections are also reused. BEM output connections are opened only when their relay bank changes.
+The four first boards are kept connected and automatically reconnected after communication errors. The BEM input connections are also reused. BEM output connections are opened only when their relay bank changes. Failed devices are retried after a five-second backoff so one offline device cannot continuously stall the controller.
 
 ## Main loop
 
 Each cycle:
 
-1. reads all physical inputs;
-2. detects key edges;
-3. generates the release edge for keys injected during the preceding cycle;
-4. runs minute-based rules when the minute changes;
-5. serves pending HTTP commands;
-6. runs key rules;
-7. writes only changed relay banks;
-8. records key timing data.
+1. starts both BEM input requests and all EasyDAQ input reads concurrently;
+2. collects the four EasyDAQ boards as groups and both BEM replies with `select()`, so independent devices do not serialize their response times;
+3. detects key edges;
+4. generates the release edge for keys injected during the preceding cycle;
+5. runs minute-based rules when the minute changes;
+6. serves pending HTTP commands;
+7. runs key rules;
+8. writes only changed relay banks, sending independent EasyDAQ boards in parallel groups;
+9. records key timing data.
 
 Timing uses `CLOCK_MONOTONIC`, so relay timers and press duration are not affected by wall-clock corrections.
 
@@ -141,7 +142,7 @@ Commands:
 
 `delete` disables a rule only in memory. `reload` restores the rules from `config`.
 
-The HTTP server is handled directly by the controller. The PHP implementation forked a process and generated `q3.php` to communicate commands back to the parent; neither mechanism is required here.
+The HTTP server is handled directly by the controller. Accepted clients are non-blocking and up to eight connections can remain active concurrently. Requests and responses are advanced incrementally on successive controller cycles, so a slow or stalled browser cannot pause input polling or relay processing. Idle HTTP clients are closed after five seconds. The PHP implementation forked a process and generated `q3.php` to communicate commands back to the parent; neither mechanism is required here.
 
 ## Corrections and hardening
 
@@ -158,5 +159,11 @@ The C implementation intentionally fixes defects rather than reproducing them:
 - virtual keys are correctly defined as 64-71;
 - hour windows that cross midnight work correctly;
 - wall-clock time and monotonic elapsed-time measurement are kept separate.
+- input polling is concurrent: BEM requests overlap the two EasyDAQ read phases, and `select()` waits for groups instead of serially waiting on each device;
+- output changes on independent EasyDAQ boards are grouped, reducing unnecessary per-board delays;
+- an output is marked synchronized only after its network write succeeds, so failed writes are automatically retried;
+- failed input and BEM output devices use a five-second reconnect backoff, preventing one offline unit from repeatedly blocking the whole loop;
+- formatted HTTP and configuration text uses bounded formatting;
+- HTTP clients are fully non-blocking and isolated from the real-time controller loop, with incremental reads/writes and an idle timeout.
 
 The hardware protocol and automation semantics reproduce the original public PHP source and `config.php` version 113. In particular, the five-second `3level`/`3light` interval is measured between releases, exactly as in the PHP state machine.
